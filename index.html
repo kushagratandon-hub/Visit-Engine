@@ -284,6 +284,12 @@ tr:last-child td{border-bottom:none}
   <div id="ve-loading" class="loading"><div class="spin"></div>Loading Visit Engine data...</div>
   <div id="ve-content" style="display:none">
 
+    <!-- Debug Panel (auto-hides when data loads fine) -->
+    <div id="ve-debug-panel" style="display:block;background:#1e293b;color:#94a3b8;border-radius:10px;padding:12px 16px;margin-bottom:14px;font-family:monospace;font-size:11px;line-height:1.7">
+      <div style="color:#f1f5f9;font-weight:700;margin-bottom:6px">🔍 Visit Engine Debug Info</div>
+      <div id="ve-debug-txt"><div style="color:#f1f5f9;font-weight:700">⏳ Loading Visit Engine data from sheet...</div></div>
+    </div>
+
     <!-- Filters -->
     <div class="fbar">
       <span class="flabel">FOS</span>
@@ -293,7 +299,7 @@ tr:last-child td{border-bottom:none}
       <span class="flabel">City</span><select id="ve-city" onchange="renderVisitEngine()"><option value="">All</option></select>
       <span class="flabel">Action</span>
       <select id="ve-action" onchange="renderVisitEngine()">
-        <option value="">All Actions</option>
+        <option value="" selected>All Actions</option>
         <option value="NEW VISIT">🔴 NEW VISIT</option>
         <option value="RE-VISIT">🟡 RE-VISIT</option>
         <option value="ESCALATE">⚠️ ESCALATE</option>
@@ -391,7 +397,8 @@ tr:last-child td{border-bottom:none}
 // ════════════════════════════════════════════════════════════════
 const SHEET_FOS_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?output=csv";
 const SHEET_VISITS_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?gid=796988726&single=true&output=csv";
-const SHEET_VE_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?gid=1211178034&single=true&output=csv";
+// Visit Engine sheet — different spreadsheet from FOS/Visits sheets
+const SHEET_VE_URL = "https://docs.google.com/spreadsheets/d/1bctwfKldYNae7iEGN9RcCLuDkSUgE2o79eWYlAM11mQ/export?format=csv&gid=1211178034";
 
 const DATE_COLS = ["1st Apr","2nd Apr","3rd Apr","4th Apr","5th Apr","6th Apr","7th Apr","8th Apr","9th Apr","10th Apr","11th Apr","12th Apr","13th Apr","14th Apr","15th Apr","16th Apr","17th Apr","18th Apr","19th Apr","20th Apr","21st Apr","22nd Apr","23rd Apr","24th Apr","25th Apr","26th Apr","27th Apr","28th Apr","29th Apr","30th Apr"];
 
@@ -537,46 +544,125 @@ async function loadVisits() {
 
 // ════════════════════════════════════════════════════════════════
 // VISIT ENGINE LOADER
-// Columns: Dealer_Code(0), Dealer_Name(1), City(2), FOS(3),
-//          SM(4), RSM(5), Lead_MTD(6), Red_MTD(7), Disb_MTD(8),
-//          Lead_LMTD(9), Red_LMTD(10), Disb_LMTD(11), MTD_Visits(12)
+// Columns MUST be in this exact order in the sheet (row 0 = headers):
+//   0:Dealer_Code  1:Dealer_Name  2:City       3:FOS
+//   4:SM           5:RSM          6:Lead_MTD   7:Red_MTD
+//   8:Disb_MTD     9:Lead_LMTD   10:Red_LMTD  11:Disb_LMTD
+//  12:MTD_Visits
+// Falls back to positional if header names differ.
 // ════════════════════════════════════════════════════════════════
+let VE_DEBUG = { rawRows: [], headerRow: [], colMap: {}, totalRows: 0, skipped: 0, noFlag: 0, parsed: 0 };
+
 async function loadVisitEngine() {
   const res = await fetch(SHEET_VE_URL + "&t=" + Date.now());
   if (!res.ok) throw new Error("Visit Engine sheet HTTP " + res.status);
-  const rows = parseCSV(await res.text());
+  const raw = await res.text();
 
-  // detect header row index
-  let headerIdx = 0;
-  for (let i = 0; i < Math.min(5, rows.length); i++) {
-    if (rows[i].some(c => /dealer.?code/i.test(c) || /dealer.?name/i.test(c))) { headerIdx = i; break; }
+  // Store raw preview for diagnostics (first 5 lines of the CSV text)
+  VE_DEBUG.rawLines = raw.split('\n').slice(0, 5).join('\n');
+
+  const rows = parseCSV(raw);
+  VE_DEBUG.totalRows = rows.length;
+
+  if (rows.length < 2) {
+    VE_DEBUG.error = 'Sheet returned fewer than 2 rows — check it is published to web as CSV';
+    return [];
   }
 
+  // ── Store raw first 3 rows for display ───────────────────────
+  VE_DEBUG.rawRows = rows.slice(0, 3);
+
+  // ── Find the header row ──────────────────────────────────────
+  // Look for a row that contains at least one known column keyword
+  const KNOWN = ['dealer', 'fos', 'lead', 'disb', 'visit', 'city', 'rsm'];
+  let headerIdx = 0; // default: row 0
+  for (let i = 0; i < Math.min(5, rows.length); i++) {
+    const joined = rows[i].join('|').toLowerCase();
+    if (KNOWN.some(k => joined.includes(k))) { headerIdx = i; break; }
+  }
+
+  // ── Build header→index map ───────────────────────────────────
+  // Normalize: lowercase, collapse spaces/underscores/dashes to single underscore
+  const norm  = s => s.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
+  const hdrs  = rows[headerIdx].map(norm);
+  VE_DEBUG.headerRow = hdrs;
+
+  // Exact match, then prefix match, then substring match — NEVER match 'sm' inside 'rsm'
+  const findCol = (exact, ...aliases) => {
+    // Pass 1: exact
+    let idx = hdrs.indexOf(exact);
+    if (idx !== -1) return idx;
+    // Pass 2: aliases exact
+    for (const a of aliases) { idx = hdrs.indexOf(a); if (idx !== -1) return idx; }
+    // Pass 3: exact word boundary (underscore-bordered)
+    const tryBound = (t) => hdrs.findIndex(h => h === t || h.startsWith(t + '_') || h.endsWith('_' + t));
+    idx = tryBound(exact);
+    if (idx !== -1) return idx;
+    for (const a of aliases) { idx = tryBound(a); if (idx !== -1) return idx; }
+    // Pass 4: substring (last resort)
+    idx = hdrs.findIndex(h => h.includes(exact));
+    if (idx !== -1) return idx;
+    for (const a of aliases) { idx = hdrs.findIndex(h => h.includes(a)); if (idx !== -1) return idx; }
+    return -1;
+  };
+
+  const CI = {
+    code:       findCol('dealer_code','code','dlr_code','dealercode'),
+    name:       findCol('dealer_name','name','dlr_name','dealership','dealer'),
+    city:       findCol('city','location','hub'),
+    fos:        findCol('fos','fo','field_officer','fo_name','fo_email'),
+    // SM: exact 'sm' only — must NOT pick 'rsm'
+    sm:         hdrs.indexOf('sm') !== -1 ? hdrs.indexOf('sm') : findCol('sm_name','sm_email','sales_manager'),
+    rsm:        findCol('rsm','rsm_name','rsm_email','regional'),
+    lead_mtd:   findCol('lead_mtd','leads_mtd','lead_count_mtd'),
+    red_mtd:    findCol('red_mtd','redmtd','red_channel_mtd','discarded_mtd'),
+    disb_mtd:   findCol('disb_mtd','disbmtd','disbursals_mtd','disbursal_mtd','disb_count_mtd'),
+    lead_lmtd:  findCol('lead_lmtd','leads_lmtd','lead_count_lmtd'),
+    red_lmtd:   findCol('red_lmtd','redlmtd','red_channel_lmtd'),
+    disb_lmtd:  findCol('disb_lmtd','disblmtd','disbursals_lmtd','disbursal_lmtd'),
+    mtd_visits: findCol('mtd_visits','visits_mtd','visit_count_mtd','total_visits','visits'),
+  };
+
+  // Positional fallback for any col still -1
+  const POS = { code:0, name:1, city:2, fos:3, sm:4, rsm:5,
+                lead_mtd:6, red_mtd:7, disb_mtd:8,
+                lead_lmtd:9, red_lmtd:10, disb_lmtd:11, mtd_visits:12 };
+  Object.keys(CI).forEach(k => { if (CI[k] === -1) CI[k] = POS[k]; });
+  VE_DEBUG.colMap = CI;
+
+  console.log('[VE] headerIdx:', headerIdx, '| headers:', hdrs);
+  console.log('[VE] column map:', CI);
+
+  const g = (row, k) => (row[CI[k]] !== undefined ? String(row[CI[k]]).trim() : '');
+  const n = (row, k) => Math.max(0, parseFloat(g(row, k)) || 0);
+
   const dealers = [];
+  VE_DEBUG.skipped = 0;
+  VE_DEBUG.noFlag  = 0;
+
   for (let i = headerIdx + 1; i < rows.length; i++) {
     const r = rows[i];
-    if (!r[0] || !r[3]) continue;
-    const fos = r[3].trim();
-    if (!fos || fos.toLowerCase() === 'unmapped' || fos === '' || fos === '-') continue;
+    if (!r || r.every(c => !String(c).trim())) continue;  // blank row
 
-    const lead_mtd   = Math.max(0, parseInt(r[6])  || 0);
-    const red_mtd    = Math.max(0, parseInt(r[7])  || 0);
-    const disb_mtd   = Math.max(0, parseInt(r[8])  || 0);
-    const lead_lmtd  = Math.max(0, parseInt(r[9])  || 0);
-    const red_lmtd   = Math.max(0, parseInt(r[10]) || 0);
-    const disb_lmtd  = Math.max(0, parseInt(r[11]) || 0);
-    const mtd_visits = Math.max(0, parseInt(r[12]) || 0);
+    const fos = g(r, 'fos');
+    if (!fos || /^unmapped$/i.test(fos) || fos === '-' || fos === '') {
+      VE_DEBUG.skipped++;
+      continue;
+    }
+
+    const lead_mtd   = n(r, 'lead_mtd');
+    const red_mtd    = n(r, 'red_mtd');
+    const disb_mtd   = n(r, 'disb_mtd');
+    const lead_lmtd  = n(r, 'lead_lmtd');
+    const red_lmtd   = n(r, 'red_lmtd');
+    const disb_lmtd  = n(r, 'disb_lmtd');
+    const mtd_visits = n(r, 'mtd_visits');
 
     // ── FLAG A: Activity Reversal ──────────────────────────────
-    // Active LMTD (leads OR disb > 0) AND dead MTD (both = 0)
-    const flagA = ((lead_lmtd > 0 || disb_lmtd > 0) && (lead_mtd === 0 && disb_mtd === 0)) ? 1 : 0;
+    const flagA = ((lead_lmtd > 0 || disb_lmtd > 0) && lead_mtd === 0 && disb_mtd === 0) ? 1 : 0;
 
     // ── FLAG B: Lead Drop > 40% ────────────────────────────────
-    let flagB = 0;
-    if (lead_lmtd >= 2 && lead_mtd < lead_lmtd) {
-      const drop = (lead_lmtd - lead_mtd) / lead_lmtd;
-      if (drop > 0.4) flagB = 1;
-    }
+    const flagB = (lead_lmtd >= 2 && lead_mtd < lead_lmtd && (lead_lmtd - lead_mtd) / lead_lmtd > 0.4) ? 1 : 0;
 
     // ── FLAG C: Disbursal Drop ─────────────────────────────────
     const flagC = (disb_lmtd >= 1 && disb_mtd < disb_lmtd) ? 1 : 0;
@@ -584,54 +670,41 @@ async function loadVisitEngine() {
     // ── FLAG D: Red Channel Spike ──────────────────────────────
     let flagD = 0;
     if (lead_mtd >= 2 && red_mtd >= 1) {
-      const redRatioMTD  = lead_mtd  > 0 ? red_mtd  / lead_mtd  : 0;
-      const redRatioLMTD = lead_lmtd > 0 ? red_lmtd / lead_lmtd : 0;
-      if (redRatioMTD > redRatioLMTD && red_mtd > red_lmtd) flagD = 1;
+      const rmtd  = red_mtd  / lead_mtd;
+      const rlmtd = lead_lmtd > 0 ? red_lmtd / lead_lmtd : 0;
+      if (rmtd > rlmtd && red_mtd > red_lmtd) flagD = 1;
     }
 
-    // Skip dealers with no flags
-    if (!flagA && !flagB && !flagC && !flagD) continue;
+    if (!flagA && !flagB && !flagC && !flagD) { VE_DEBUG.noFlag++; continue; }
 
-    // ── PRIORITY SCORE ─────────────────────────────────────────
     const score = +(
-      3 * flagA +
-      2 * flagC +
-      1.5 * flagB +
-      1 * flagD +
-      0.3 * Math.log(1 + lead_lmtd + 3 * disb_lmtd) -
+      3*flagA + 2*flagC + 1.5*flagB + 1*flagD +
+      0.3 * Math.log(1 + lead_lmtd + 3*disb_lmtd) -
       0.4 * Math.min(mtd_visits, 5)
     ).toFixed(3);
 
-    // ── ACTION TYPE ────────────────────────────────────────────
-    let actionType;
-    if (mtd_visits === 0) actionType = 'NEW VISIT';
-    else if (mtd_visits <= 3) actionType = 'RE-VISIT';
-    else actionType = 'ESCALATE';
-
-    const flags = [];
-    if (flagA) flags.push('A');
-    if (flagB) flags.push('B');
-    if (flagC) flags.push('C');
-    if (flagD) flags.push('D');
+    const actionType = mtd_visits === 0 ? 'NEW VISIT'
+                     : mtd_visits <= 3  ? 'RE-VISIT'
+                     : 'ESCALATE';
 
     dealers.push({
-      code: r[0].trim(),
-      name: (r[1] || '').trim(),
-      city: (r[2] || '').trim() || 'Unknown',
-      fos: fos.toLowerCase(),
-      fosDisplay: fos,
-      sm: (r[4] || '').trim().toLowerCase(),
-      rsm: (r[5] || '').trim().toLowerCase(),
+      code: g(r,'code'), name: g(r,'name'),
+      city: g(r,'city') || 'Unknown',
+      fos:  fos.toLowerCase(),
+      sm:   g(r,'sm').toLowerCase(),
+      rsm:  g(r,'rsm').toLowerCase(),
       lead_mtd, red_mtd, disb_mtd,
       lead_lmtd, red_lmtd, disb_lmtd,
       mtd_visits, score,
-      flagA, flagB, flagC, flagD, flags,
+      flagA, flagB, flagC, flagD,
       actionType, recommended: false
     });
   }
 
-  // Sort by score desc, then mark top 2 per FOS
-  dealers.sort((a, b) => b.score - a.score);
+  VE_DEBUG.parsed = dealers.length;
+  console.log(`[VE] DONE: ${dealers.length} at-risk | skipped(unmapped)=${VE_DEBUG.skipped} | skipped(noFlag)=${VE_DEBUG.noFlag}`);
+
+  dealers.sort((a,b) => b.score - a.score);
   const fosCounts = {};
   dealers.forEach(d => {
     if (!fosCounts[d.fos]) fosCounts[d.fos] = 0;
@@ -642,25 +715,34 @@ async function loadVisitEngine() {
 }
 
 // ════════════════════════════════════════════════════════════════
-// LOAD ALL
+// LOAD ALL — VE loads independently so FOS/Visits still work if VE fails
 // ════════════════════════════════════════════════════════════════
 async function loadAllData() {
   try {
-    const [fos, visits, ve] = await Promise.all([loadFOS(), loadVisits(), loadVisitEngine()]);
-    FOS_DATA = fos;
-    VISITS_DATA = visits;
-    VE_DATA = ve;
-    const now = new Date().toLocaleTimeString('en-IN', {timeZone: 'Asia/Kolkata', hour: '2-digit', minute: '2-digit', hour12: true});
-    document.getElementById('sync-txt').textContent = 'Synced ' + now;
-    document.getElementById('error-box').innerHTML = '';
-    return true;
+    const [fos, visits] = await Promise.all([loadFOS(), loadVisits()]);
+    FOS_DATA     = fos;
+    VISITS_DATA  = visits;
   } catch (err) {
-    console.error(err);
+    console.error('[FOS/Visits load error]', err);
     document.getElementById('error-box').innerHTML =
-      '<div class="err">⚠️ Data load failed: ' + err.message + '. Check all sheet tabs are published to web as CSV.</div>';
+      '<div class="err">⚠️ FOS/Visits data load failed: ' + err.message + '</div>';
     document.getElementById('sync-txt').textContent = 'Sync failed';
     return false;
   }
+
+  // Load VE separately — failure here does NOT block the rest of the dashboard
+  try {
+    VE_DATA = await loadVisitEngine();
+  } catch (err) {
+    console.error('[VE load error]', err);
+    VE_DEBUG.error = err.message;
+    VE_DATA = [];
+  }
+
+  const now = new Date().toLocaleTimeString('en-IN', {timeZone:'Asia/Kolkata', hour:'2-digit', minute:'2-digit', hour12:true});
+  document.getElementById('sync-txt').textContent = 'Synced ' + now;
+  document.getElementById('error-box').innerHTML = '';
+  return true;
 }
 
 async function refreshData() {
@@ -1066,6 +1148,39 @@ function getVEFiltered() {
 function renderVisitEngine() {
   document.getElementById('ve-loading').style.display = 'none';
   document.getElementById('ve-content').style.display = 'block';
+
+  // Show debug panel if no data loaded
+  const dbgPanel = document.getElementById('ve-debug-panel');
+  const dbgTxt   = document.getElementById('ve-debug-txt');
+  if (VE_DATA.length === 0 && dbgTxt) {
+    dbgPanel.style.display = 'block';
+    const ci  = VE_DEBUG.colMap  || {};
+    const hdr = VE_DEBUG.headerRow || [];
+    // Raw rows preview table
+    const rawHtml = VE_DEBUG.rawRows && VE_DEBUG.rawRows.length
+      ? '<div style="margin-top:8px;color:#f1f5f9;font-weight:700">📄 Raw sheet rows (first 3):</div>' +
+        VE_DEBUG.rawRows.map((row, i) =>
+          `<div style="margin:2px 0;color:${i===0?'#86efac':'#cbd5e1'}">[${i}] ${row.map(c=>JSON.stringify(c||'')).join(', ')}</div>`
+        ).join('')
+      : '<div style="color:#ef4444">⚠️ No rows received from sheet. Is it published as CSV?</div>';
+
+    // Column map with header name shown alongside index
+    const ciLine = (k) => `${k}→<span style="color:#fbbf24">[${ci[k]}]</span>${ci[k]>=0?`<span style="color:#86efac">(${hdr[ci[k]]||'?'})</span>`:'<span style="color:#ef4444">NOT FOUND</span>'}`;
+
+    dbgTxt.innerHTML = [
+      `<div style="color:#f1f5f9;font-weight:700;margin-bottom:4px">📊 Visit Engine Diagnostics</div>`,
+      `Sheet rows fetched: <span style="color:#fbbf24">${VE_DEBUG.totalRows}</span>`,
+      VE_DEBUG.error ? `<span style="color:#ef4444">❌ Load error: ${VE_DEBUG.error}</span>` : '',
+      `Skipped unmapped/blank FOS: <span style="color:#fbbf24">${VE_DEBUG.skipped}</span>`,
+      `Skipped no-flag rows: <span style="color:#fbbf24">${VE_DEBUG.noFlag}</span>`,
+      `At-risk dealers found: <span style="color:${VE_DEBUG.parsed>0?'#86efac':'#ef4444'}">${VE_DEBUG.parsed||0}</span>`,
+      `<div style="margin-top:6px;color:#94a3b8">Column map detected: ${['code','name','city','fos','sm','rsm','lead_mtd','red_mtd','disb_mtd','lead_lmtd','red_lmtd','disb_lmtd','mtd_visits'].map(ciLine).join(' &nbsp; ')}</div>`,
+      rawHtml,
+      `<div style="margin-top:6px;color:#64748b">→ Also check browser console (F12) for full details</div>`
+    ].join('\n');
+  } else if (dbgPanel) {
+    dbgPanel.style.display = 'none';
+  }
 
   const data = getVEFiltered();
 
