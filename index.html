@@ -397,8 +397,7 @@ tr:last-child td{border-bottom:none}
 // ════════════════════════════════════════════════════════════════
 const SHEET_FOS_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?output=csv";
 const SHEET_VISITS_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?gid=796988726&single=true&output=csv";
-// Visit Engine sheet — different spreadsheet from FOS/Visits sheets
-const SHEET_VE_URL = "https://docs.google.com/spreadsheets/d/1bctwfKldYNae7iEGN9RcCLuDkSUgE2o79eWYlAM11mQ/export?format=csv&gid=1211178034";
+const SHEET_VE_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?gid=1211178034&single=true&output=csv";
 
 const DATE_COLS = ["1st Apr","2nd Apr","3rd Apr","4th Apr","5th Apr","6th Apr","7th Apr","8th Apr","9th Apr","10th Apr","11th Apr","12th Apr","13th Apr","14th Apr","15th Apr","16th Apr","17th Apr","18th Apr","19th Apr","20th Apr","21st Apr","22nd Apr","23rd Apr","24th Apr","25th Apr","26th Apr","27th Apr","28th Apr","29th Apr","30th Apr"];
 
@@ -554,10 +553,38 @@ async function loadVisits() {
 let VE_DEBUG = { rawRows: [], headerRow: [], colMap: {}, totalRows: 0, skipped: 0, noFlag: 0, parsed: 0 };
 
 async function loadVisitEngine() {
-  const res = await fetch(SHEET_VE_URL + "&t=" + Date.now());
-  if (!res.ok) throw new Error("Visit Engine sheet HTTP " + res.status);
-  const raw = await res.text();
+  // Try primary URL, with fallback to gviz endpoint
+  const urls = [
+    SHEET_VE_URL + "&t=" + Date.now(),
+    "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?gid=1211178034&single=true&output=csv&t=" + Date.now()
+  ];
 
+  let raw = '';
+  let usedUrl = '';
+  for (const url of urls) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) { VE_DEBUG.httpStatus = res.status; continue; }
+      const txt = await res.text();
+      // Detect HTML redirect (login page / error page)
+      if (txt.trim().startsWith('<') || txt.toLowerCase().includes('<!doctype')) {
+        VE_DEBUG.htmlResponse = txt.slice(0, 200);
+        console.warn('[VE] URL returned HTML, not CSV:', url, txt.slice(0, 100));
+        continue;
+      }
+      raw = txt;
+      usedUrl = url;
+      break;
+    } catch(e) { console.warn('[VE] fetch failed for', url, e); }
+  }
+
+  if (!raw) {
+    VE_DEBUG.error = 'All URL attempts returned HTML (login redirect) or failed. Sheet must be published to web as CSV: File → Share → Publish to web → CSV format.';
+    VE_DEBUG.rawLines = VE_DEBUG.htmlResponse || '(no response)';
+    return [];
+  }
+
+  VE_DEBUG.usedUrl = usedUrl;
   // Store raw preview for diagnostics (first 5 lines of the CSV text)
   VE_DEBUG.rawLines = raw.split('\n').slice(0, 5).join('\n');
 
@@ -606,21 +633,28 @@ async function loadVisitEngine() {
     return -1;
   };
 
+  // ── Log all headers for diagnostics ─────────────────────────
+  console.log('[VE] All headers:', hdrs.map((h,i) => i+':'+h).join(', '));
+
   const CI = {
-    code:       findCol('dealer_code','code','dlr_code','dealercode'),
+    code:       findCol('dealer_code','code','dlr_code','dealercode','dealer_id'),
     name:       findCol('dealer_name','name','dlr_name','dealership','dealer'),
-    city:       findCol('city','location','hub'),
-    fos:        findCol('fos','fo','field_officer','fo_name','fo_email'),
-    // SM: exact 'sm' only — must NOT pick 'rsm'
+    // "Dealer City" → normalises to "dealer_city"
+    city:       findCol('city','dealer_city','location','hub'),
+    fos:        findCol('fos','fo','field_officer','fo_name','fo_email','fos_name'),
+    // SM exact first to avoid matching RSM
     sm:         hdrs.indexOf('sm') !== -1 ? hdrs.indexOf('sm') : findCol('sm_name','sm_email','sales_manager'),
-    rsm:        findCol('rsm','rsm_name','rsm_email','regional'),
-    lead_mtd:   findCol('lead_mtd','leads_mtd','lead_count_mtd'),
-    red_mtd:    findCol('red_mtd','redmtd','red_channel_mtd','discarded_mtd'),
-    disb_mtd:   findCol('disb_mtd','disbmtd','disbursals_mtd','disbursal_mtd','disb_count_mtd'),
-    lead_lmtd:  findCol('lead_lmtd','leads_lmtd','lead_count_lmtd'),
+    rsm:        findCol('rsm','rsm_name','rsm_email','regional_sm'),
+    // "Leads" / "Lead MTD" / "Lead_MTD"
+    lead_mtd:   findCol('lead_mtd','leads_mtd','lead_count_mtd','leads','lead'),
+    // "Red" / "Red MTD"
+    red_mtd:    findCol('red_mtd','redmtd','red_channel_mtd','discarded_mtd','red'),
+    // "Disbursals" / "Disb MTD" / "Disbursal"
+    disb_mtd:   findCol('disb_mtd','disbmtd','disbursals_mtd','disbursal_mtd','disbursals','disbursal','disb'),
+    lead_lmtd:  findCol('lead_lmtd','leads_lmtd','lead_count_lmtd','leads_lmtd'),
     red_lmtd:   findCol('red_lmtd','redlmtd','red_channel_lmtd'),
     disb_lmtd:  findCol('disb_lmtd','disblmtd','disbursals_lmtd','disbursal_lmtd'),
-    mtd_visits: findCol('mtd_visits','visits_mtd','visit_count_mtd','total_visits','visits'),
+    mtd_visits: findCol('mtd_visits','visits_mtd','visit_count_mtd','total_visits','mtd_visit','visits'),
   };
 
   // Positional fallback for any col still -1
@@ -1152,32 +1186,46 @@ function renderVisitEngine() {
   // Show debug panel if no data loaded
   const dbgPanel = document.getElementById('ve-debug-panel');
   const dbgTxt   = document.getElementById('ve-debug-txt');
-  if (VE_DATA.length === 0 && dbgTxt) {
-    dbgPanel.style.display = 'block';
-    const ci  = VE_DEBUG.colMap  || {};
-    const hdr = VE_DEBUG.headerRow || [];
-    // Raw rows preview table
-    const rawHtml = VE_DEBUG.rawRows && VE_DEBUG.rawRows.length
-      ? '<div style="margin-top:8px;color:#f1f5f9;font-weight:700">📄 Raw sheet rows (first 3):</div>' +
-        VE_DEBUG.rawRows.map((row, i) =>
-          `<div style="margin:2px 0;color:${i===0?'#86efac':'#cbd5e1'}">[${i}] ${row.map(c=>JSON.stringify(c||'')).join(', ')}</div>`
-        ).join('')
-      : '<div style="color:#ef4444">⚠️ No rows received from sheet. Is it published as CSV?</div>';
+  if (VE_DATA.length === 0) {
+    // Always show debug panel when no data
+    if (dbgPanel) dbgPanel.style.display = 'block';
+    if (dbgTxt) {
+      const ci  = VE_DEBUG.colMap  || {};
+      const hdr = VE_DEBUG.headerRow || [];
 
-    // Column map with header name shown alongside index
-    const ciLine = (k) => `${k}→<span style="color:#fbbf24">[${ci[k]}]</span>${ci[k]>=0?`<span style="color:#86efac">(${hdr[ci[k]]||'?'})</span>`:'<span style="color:#ef4444">NOT FOUND</span>'}`;
+      // Raw rows display
+      const rawHtml = VE_DEBUG.rawRows && VE_DEBUG.rawRows.length
+        ? '<div style="margin-top:10px;margin-bottom:4px;color:#f1f5f9;font-weight:700">📄 Raw sheet data (first 3 rows received):</div>' +
+          VE_DEBUG.rawRows.map((row, i) =>
+            `<div style="margin:3px 0;padding:4px 6px;background:rgba(255,255,255,.05);border-radius:4px;color:${i===0?'#86efac':'#cbd5e1'};word-break:break-all;">[row ${i}] ${escapeHTML(row.slice(0,10).join(' | '))}</div>`
+          ).join('')
+        : '';
 
-    dbgTxt.innerHTML = [
-      `<div style="color:#f1f5f9;font-weight:700;margin-bottom:4px">📊 Visit Engine Diagnostics</div>`,
-      `Sheet rows fetched: <span style="color:#fbbf24">${VE_DEBUG.totalRows}</span>`,
-      VE_DEBUG.error ? `<span style="color:#ef4444">❌ Load error: ${VE_DEBUG.error}</span>` : '',
-      `Skipped unmapped/blank FOS: <span style="color:#fbbf24">${VE_DEBUG.skipped}</span>`,
-      `Skipped no-flag rows: <span style="color:#fbbf24">${VE_DEBUG.noFlag}</span>`,
-      `At-risk dealers found: <span style="color:${VE_DEBUG.parsed>0?'#86efac':'#ef4444'}">${VE_DEBUG.parsed||0}</span>`,
-      `<div style="margin-top:6px;color:#94a3b8">Column map detected: ${['code','name','city','fos','sm','rsm','lead_mtd','red_mtd','disb_mtd','lead_lmtd','red_lmtd','disb_lmtd','mtd_visits'].map(ciLine).join(' &nbsp; ')}</div>`,
-      rawHtml,
-      `<div style="margin-top:6px;color:#64748b">→ Also check browser console (F12) for full details</div>`
-    ].join('\n');
+      // Raw text preview (first line)
+      const rawLineHtml = VE_DEBUG.rawLines
+        ? `<div style="margin-top:6px;color:#64748b;word-break:break-all;font-size:10px">First CSV line: <span style="color:#fbbf24">${escapeHTML(String(VE_DEBUG.rawLines).slice(0,300))}</span></div>`
+        : '';
+
+      const ciLine = k => {
+        const idx = ci[k];
+        const hname = (idx >= 0 && hdr[idx]) ? hdr[idx] : '?';
+        return `<span style="color:#94a3b8">${k}</span>=<span style="color:${idx>=0?'#fbbf24':'#ef4444'}">[${idx}]${idx>=0?'('+hname+')':''}</span>`;
+      };
+
+      dbgTxt.innerHTML = `
+        <div style="color:#f1f5f9;font-weight:700;font-size:12px;margin-bottom:8px">🔍 Visit Engine — Debug Info (VE_DATA is empty)</div>
+        ${VE_DEBUG.error ? `<div style="background:#7f1d1d;color:#fca5a5;padding:8px 10px;border-radius:6px;margin-bottom:8px">❌ ${escapeHTML(VE_DEBUG.error)}</div>` : ''}
+        ${VE_DEBUG.htmlResponse ? `<div style="background:#7c2d12;color:#fed7aa;padding:8px 10px;border-radius:6px;margin-bottom:8px">⚠️ Sheet returned HTML (login redirect). The sheet must be published as CSV via: File → Share → Publish to web → choose the tab → CSV format.</div>` : ''}
+        <div>URLs tried: <span style="color:#86efac">${escapeHTML(SHEET_VE_URL)}</span></div>
+        <div>Used URL: <span style="color:${VE_DEBUG.usedUrl?'#86efac':'#ef4444'}">${escapeHTML(VE_DEBUG.usedUrl||'NONE — all failed')}</span></div>
+        <div>Total rows parsed: <span style="color:#fbbf24">${VE_DEBUG.totalRows||0}</span></div>
+        <div>Skipped (unmapped FOS): <span style="color:#fbbf24">${VE_DEBUG.skipped||0}</span> &nbsp; No-flag rows: <span style="color:#fbbf24">${VE_DEBUG.noFlag||0}</span> &nbsp; At-risk found: <span style="color:#ef4444">${VE_DEBUG.parsed||0}</span></div>
+        ${VE_DEBUG.headerRow && VE_DEBUG.headerRow.length ? `<div style="margin-top:6px">Headers detected: <span style="color:#86efac">${escapeHTML(VE_DEBUG.headerRow.join(', '))}</span></div>` : ''}
+        ${VE_DEBUG.parsed === 0 && VE_DEBUG.totalRows > 2 ? `<div style="margin-top:4px;color:#fca5a5">Columns mapped: ${['code','name','city','fos','sm','rsm','lead_mtd','red_mtd','disb_mtd','lead_lmtd','red_lmtd','disb_lmtd','mtd_visits'].map(ciLine).join(' ')}</div>` : ''}
+        ${rawHtml}
+        ${rawLineHtml}
+        <div style="margin-top:8px;color:#64748b;font-size:10px">→ Press F12 → Console for full details</div>`;
+    }
   } else if (dbgPanel) {
     dbgPanel.style.display = 'none';
   }
