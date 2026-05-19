@@ -293,7 +293,8 @@ tr:last-child td{border-bottom:none}
     <!-- Filters -->
     <div class="fbar">
       <span class="flabel">FOS</span>
-      <input type="text" id="ve-q" placeholder="🔍 Search FOS, dealer, city..." oninput="renderVisitEngine()" style="width:200px">
+      <input type="text" id="ve-q" placeholder="🔍 Search dealer, city..." oninput="renderVisitEngine()" style="width:160px">
+      <select id="ve-fos" onchange="renderVisitEngine()" style="width:160px"><option value="">All FOS</option></select>
       <span class="flabel">SM</span><select id="ve-sm" onchange="renderVisitEngine()"><option value="">All</option></select>
       <span class="flabel">RSM</span><select id="ve-rsm" onchange="renderVisitEngine()"><option value="">All</option></select>
       <span class="flabel">City</span><select id="ve-city" onchange="renderVisitEngine()"><option value="">All</option></select>
@@ -310,7 +311,7 @@ tr:last-child td{border-bottom:none}
         <option value="A">Flag A — Activity Reversal</option>
         <option value="B">Flag B — Lead Drop</option>
         <option value="C">Flag C — Disbursal Drop</option>
-        <option value="D">Flag D — Red Channel Spike</option>
+
       </select>
       <span class="flabel">Show</span>
       <select id="ve-show" onchange="renderVisitEngine()">
@@ -330,7 +331,7 @@ tr:last-child td{border-bottom:none}
         <div class="flag-legend-item"><span class="flag-pill flag-a">A</span><span>Activity Reversal — Active LMTD, dead MTD</span></div>
         <div class="flag-legend-item"><span class="flag-pill flag-b">B</span><span>Lead Drop — LMTD ≥ 2, MTD drop &gt;40%</span></div>
         <div class="flag-legend-item"><span class="flag-pill flag-c">C</span><span>Disbursal Drop — Disb MTD &lt; Disb LMTD</span></div>
-        <div class="flag-legend-item"><span class="flag-pill flag-d">D</span><span>Red Channel Spike — Red ratio + count up</span></div>
+
         <div class="flag-legend-item" style="margin-left:auto;color:#64748b;font-size:10px">
           <span class="recommended-dot"></span>Green rows = Today's recommendations (top 2 per FOS)
         </div>
@@ -381,7 +382,6 @@ tr:last-child td{border-bottom:none}
             <th>Leads LMTD</th>
             <th>Disb MTD</th>
             <th>Disb LMTD</th>
-            <th>Red MTD</th>
           </tr></thead>
           <tbody id="ve-tbl-bd"></tbody>
         </table>
@@ -395,7 +395,7 @@ tr:last-child td{border-bottom:none}
 // ════════════════════════════════════════════════════════════════
 // SHEET URLs
 // ════════════════════════════════════════════════════════════════
-const SHEET_FOS_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?output=csv";
+const SHEET_FOS_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?single=true&output=csv";
 const SHEET_VISITS_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?gid=796988726&single=true&output=csv";
 const SHEET_VE_URL = "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?gid=1211178034&single=true&output=csv";
 
@@ -489,7 +489,17 @@ function currentMonthName() {
 async function loadFOS() {
   const res = await fetch(SHEET_FOS_URL + "&t=" + Date.now());
   if (!res.ok) throw new Error("FOS sheet HTTP " + res.status);
-  const rows = parseCSV(await res.text());
+  const rawText = await res.text();
+  // Detect HTML redirect (login page)
+  if (rawText.trim().startsWith('<')) throw new Error("FOS sheet returned HTML — check it is published to web as CSV");
+  const rows = parseCSV(rawText);
+  // Detect wrong tab: if no row has "@" in col 0, the default tab may have changed
+  const hasEmails = rows.some(r => r[0] && r[0].includes("@"));
+  if (rows.length > 2 && !hasEmails) {
+    console.warn('[FOS] No email addresses found in col 0 — wrong tab may be loading. First row col0:', rows[0]?.[0], rows[1]?.[0]);
+    const errDiv = document.getElementById('error-box');
+    if (errDiv) errDiv.innerHTML = '<div class="err">⚠️ FOS sheet appears to be loading the wrong tab (no FOS emails found). Open the FOS summary sheet tab → File → Share → Publish to web → select the FOS tab → copy the URL with its gid → share with us.</div>';
+  }
   const fos = [];
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
@@ -562,13 +572,13 @@ async function loadVisitEngine() {
   // POSITIONAL MAP (0-indexed columns):
   //  0: Dealer Code   1: Dealership Name   2: Dealer City
   //  3: FOS Mapped    4: SM Mapped         5: RSM Mapped
-  //  6: Lead(MTD)     7: Red Channel(MTD)  8: Disbursals(MTD)
-  //  9: Lead(LMTD)   10: Red Channel(LMTD) 11: Disbursals(LMTD)
+  //  6: Lead(MTD)     7: Red Channel(MTD)  8: Disbursals(MTD)   [col 7 unused]
+  //  9: Lead(LMTD)   10: Red Channel(LMTD) 11: Disbursals(LMTD) [col 10 unused]
   // 12: MTD_Visits
 
   const CI = { code:0, name:1, city:2, fos:3, sm:4, rsm:5,
-               lead_mtd:6, red_mtd:7, disb_mtd:8,
-               lead_lmtd:9, red_lmtd:10, disb_lmtd:11, mtd_visits:12 };
+               lead_mtd:6, disb_mtd:8,
+               lead_lmtd:9, disb_lmtd:11, mtd_visits:12 };
 
   // Try primary pub URL, then gviz fallback
   const urls = [
@@ -646,18 +656,10 @@ async function loadVisitEngine() {
     const flagB = (lead_lmtd >= 2 && lead_mtd < lead_lmtd && (lead_lmtd - lead_mtd) / lead_lmtd > 0.4) ? 1 : 0;
     // ── FLAG C: Disbursal Drop ─────────────────────────────────
     const flagC = (disb_lmtd >= 1 && disb_mtd < disb_lmtd) ? 1 : 0;
-    // ── FLAG D: Red Channel Spike ──────────────────────────────
-    let flagD = 0;
-    if (lead_mtd >= 2 && red_mtd >= 1) {
-      const rmtd  = red_mtd  / lead_mtd;
-      const rlmtd = lead_lmtd > 0 ? red_lmtd / lead_lmtd : 0;
-      if (rmtd > rlmtd && red_mtd > red_lmtd) flagD = 1;
-    }
-
-    if (!flagA && !flagB && !flagC && !flagD) { VE_DEBUG.noFlag++; continue; }
+    if (!flagA && !flagB && !flagC) { VE_DEBUG.noFlag++; continue; }
 
     const score = +(
-      3*flagA + 2*flagC + 1.5*flagB + 1*flagD +
+      3*flagA + 2*flagC + 1.5*flagB +
       0.3 * Math.log(1 + lead_lmtd + 3*disb_lmtd) -
       0.4 * Math.min(mtd_visits, 5)
     ).toFixed(3);
@@ -668,10 +670,10 @@ async function loadVisitEngine() {
       fos:  fos.toLowerCase(),
       sm:   g(r,'sm').toLowerCase(),
       rsm:  g(r,'rsm').toLowerCase(),
-      lead_mtd, red_mtd, disb_mtd,
-      lead_lmtd, red_lmtd, disb_lmtd,
+      lead_mtd, disb_mtd,
+      lead_lmtd, disb_lmtd,
       mtd_visits, score,
-      flagA, flagB, flagC, flagD,
+      flagA, flagB, flagC,
       actionType: mtd_visits === 0 ? 'NEW VISIT' : mtd_visits <= 3 ? 'RE-VISIT' : 'ESCALATE',
       recommended: false
     });
@@ -748,6 +750,7 @@ function setupFilters() {
   fillSelect('ts-ch', unique(FOS_DATA.map(f => f.channel)));
   fillSelect('def-ch', unique(FOS_DATA.map(f => f.channel)));
   // Visit Engine filters
+  fillSelect('ve-fos',  unique(VE_DATA.map(d => d.fos)));
   fillSelect('ve-sm',   unique(VE_DATA.map(d => d.sm)));
   fillSelect('ve-rsm',  unique(VE_DATA.map(d => d.rsm)));
   fillSelect('ve-city', unique(VE_DATA.map(d => d.city)));
@@ -792,7 +795,13 @@ function renderAll() {
   renderDefaulters();
   renderManager();
   renderFOSTable();
-  renderVisitEngine();
+  try { renderVisitEngine(); } catch(e) {
+    console.error('[renderVisitEngine error]', e);
+    const p = document.getElementById('ve-debug-panel');
+    const t = document.getElementById('ve-debug-txt');
+    if (p) p.style.display = 'block';
+    if (t) t.innerHTML = '<div style="color:#fca5a5">❌ Render error: ' + String(e) + '</div>';
+  }
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -1093,6 +1102,7 @@ function renderFOSTable() {
 // ════════════════════════════════════════════════════════════════
 function getVEFiltered() {
   const q      = (document.getElementById('ve-q').value || '').toLowerCase();
+  const fosSel = document.getElementById('ve-fos').value;
   const sm     = document.getElementById('ve-sm').value;
   const rsm    = document.getElementById('ve-rsm').value;
   const city   = document.getElementById('ve-city').value;
@@ -1102,6 +1112,7 @@ function getVEFiltered() {
 
   return VE_DATA.filter(d => {
     if (show === 'reco' && !d.recommended) return false;
+    if (fosSel && d.fos !== fosSel) return false;
     if (sm   && d.sm   !== sm)   return false;
     if (rsm  && d.rsm  !== rsm)  return false;
     if (city && d.city !== city) return false;
@@ -1110,7 +1121,7 @@ function getVEFiltered() {
       if (flag === 'A' && !d.flagA) return false;
       if (flag === 'B' && !d.flagB) return false;
       if (flag === 'C' && !d.flagC) return false;
-      if (flag === 'D' && !d.flagD) return false;
+
     }
     if (q) {
       const haystack = d.fos + ' ' + d.name.toLowerCase() + ' ' + d.code.toLowerCase() + ' ' + d.city.toLowerCase();
@@ -1162,7 +1173,7 @@ function renderVisitEngine() {
         <div>Total rows parsed: <span style="color:#fbbf24">${VE_DEBUG.totalRows||0}</span></div>
         <div>Skipped (unmapped FOS): <span style="color:#fbbf24">${VE_DEBUG.skipped||0}</span> &nbsp; No-flag rows: <span style="color:#fbbf24">${VE_DEBUG.noFlag||0}</span> &nbsp; At-risk found: <span style="color:#ef4444">${VE_DEBUG.parsed||0}</span></div>
         ${VE_DEBUG.headerRow && VE_DEBUG.headerRow.length ? `<div style="margin-top:6px">Headers detected: <span style="color:#86efac">${escapeHTML(VE_DEBUG.headerRow.join(', '))}</span></div>` : ''}
-        ${VE_DEBUG.parsed === 0 && VE_DEBUG.totalRows > 2 ? `<div style="margin-top:4px;color:#fca5a5">Columns mapped: ${['code','name','city','fos','sm','rsm','lead_mtd','red_mtd','disb_mtd','lead_lmtd','red_lmtd','disb_lmtd','mtd_visits'].map(ciLine).join(' ')}</div>` : ''}
+        ${VE_DEBUG.parsed === 0 && VE_DEBUG.totalRows > 2 ? `<div style="margin-top:4px;color:#fca5a5">Columns mapped: ${['code','name','city','fos','sm','rsm','lead_mtd','disb_mtd','lead_lmtd','disb_lmtd','mtd_visits'].map(ciLine).join(' ')}</div>` : ''}
         ${rawHtml}
         ${rawLineHtml}
         <div style="margin-top:8px;color:#64748b;font-size:10px">→ Press F12 → Console for full details</div>`;
@@ -1182,7 +1193,6 @@ function renderVisitEngine() {
   const fA = data.filter(d => d.flagA).length;
   const fB = data.filter(d => d.flagB).length;
   const fC = data.filter(d => d.flagC).length;
-  const fD = data.filter(d => d.flagD).length;
 
   document.getElementById('ve-badge').textContent = recoCount;
   document.getElementById('ve-cnt').textContent = data.length + ' dealers';
@@ -1192,7 +1202,7 @@ function renderVisitEngine() {
     <div class="kpi r"><div class="kl">🔴 New Visit</div><div class="kv">${newVisit}</div><div class="ks">0 visits MTD</div></div>
     <div class="kpi y"><div class="kl">🟡 Re-Visit</div><div class="kv">${reVisit}</div><div class="ks">1–3 visits MTD</div></div>
     <div class="kpi p"><div class="kl">⚠️ Escalate to SM</div><div class="kv">${escalate}</div><div class="ks">4+ visits still at risk</div></div>
-    <div class="kpi o"><div class="kl">🏷️ Flag Counts A/B/C/D</div><div class="kv" style="font-size:14px">${fA} / ${fB} / ${fC} / ${fD}</div><div class="ks">In current filter view</div></div>`;
+    <div class="kpi o"><div class="kl">🏷️ Flag Counts A / B / C</div><div class="kv" style="font-size:14px">${fA} / ${fB} / ${fC}</div><div class="ks">In current filter view</div></div>`;
 
   renderRSMCards(data);
   renderVisitEngineTable();
@@ -1219,7 +1229,6 @@ function renderRSMCards(data) {
     const nA = ds.filter(d => d.flagA).length;
     const nB = ds.filter(d => d.flagB).length;
     const nC = ds.filter(d => d.flagC).length;
-    const nD = ds.filter(d => d.flagD).length;
     const watchlist = ds.filter(d => d.mtd_visits >= 4 && d.actionType === 'ESCALATE').length;
     const rn = rsmName.split('@')[0];
 
@@ -1244,7 +1253,6 @@ function renderRSMCards(data) {
           <div class="rsm-flag-chip rsm-fa">A: ${nA}</div>
           <div class="rsm-flag-chip rsm-fb">B: ${nB}</div>
           <div class="rsm-flag-chip rsm-fc">C: ${nC}</div>
-          <div class="rsm-flag-chip rsm-fd">D: ${nD}</div>
         </div>
       </div>
       ${watchlist > 0 ? `<div class="rsm-watch">⚠️ <strong>${watchlist} dealer${watchlist>1?'s':''}</strong> visited 4+ times still at risk — RSM intervention needed</div>` : ''}
@@ -1276,8 +1284,7 @@ function renderVisitEngineTable() {
   const flagsHTML = d => `
     <span class="flag-pill ${d.flagA ? 'flag-a' : 'inactive'}">A</span>
     <span class="flag-pill ${d.flagB ? 'flag-b' : 'inactive'}">B</span>
-    <span class="flag-pill ${d.flagC ? 'flag-c' : 'inactive'}">C</span>
-    <span class="flag-pill ${d.flagD ? 'flag-d' : 'inactive'}">D</span>`;
+    <span class="flag-pill ${d.flagC ? 'flag-c' : 'inactive'}">C</span>`;
 
   // max score for bar scaling
   const maxScore = sorted.length ? Math.max(...sorted.map(d => d.score), 1) : 1;
@@ -1309,7 +1316,6 @@ function renderVisitEngineTable() {
       <td>${d.lead_lmtd}</td>
       <td>${d.disb_mtd}</td>
       <td>${d.disb_lmtd}</td>
-      <td style="color:${d.red_mtd>0?'#dc2626':'inherit'}">${d.red_mtd}</td>
     </tr>`;
   }).join('') || `<tr><td colspan="16" style="text-align:center;color:#94a3b8;padding:30px">No at-risk dealers match current filters ✓</td></tr>`;
 }
