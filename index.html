@@ -292,9 +292,7 @@ tr:last-child td{border-bottom:none}
 
     <!-- Filters -->
     <div class="fbar">
-      <span class="flabel">FOS</span>
-      <input type="text" id="ve-q" placeholder="🔍 Search dealer, city..." oninput="renderVisitEngine()" style="width:160px">
-      <select id="ve-fos" onchange="renderVisitEngine()" style="width:160px"><option value="">All FOS</option></select>
+      <span class="flabel">FOS</span><select id="ve-fos" onchange="renderVisitEngine()" style="min-width:150px"><option value="">All FOS</option></select>
       <span class="flabel">SM</span><select id="ve-sm" onchange="renderVisitEngine()"><option value="">All</option></select>
       <span class="flabel">RSM</span><select id="ve-rsm" onchange="renderVisitEngine()"><option value="">All</option></select>
       <span class="flabel">City</span><select id="ve-city" onchange="renderVisitEngine()"><option value="">All</option></select>
@@ -750,7 +748,15 @@ function setupFilters() {
   fillSelect('ts-ch', unique(FOS_DATA.map(f => f.channel)));
   fillSelect('def-ch', unique(FOS_DATA.map(f => f.channel)));
   // Visit Engine filters
-  fillSelect('ve-fos',  unique(VE_DATA.map(d => d.fos)));
+  // FOS dropdown: show name before @ as label, full email as value
+  const veFosEl = document.getElementById('ve-fos');
+  if (veFosEl) {
+    const cur = veFosEl.value;
+    const fosList = unique(VE_DATA.map(d => d.fos));
+    veFosEl.innerHTML = '<option value="">All FOS</option>' +
+      fosList.map(f => `<option value="${escapeHTML(f)}">${escapeHTML(f.split('@')[0])}</option>`).join('');
+    if (fosList.includes(cur)) veFosEl.value = cur;
+  }
   fillSelect('ve-sm',   unique(VE_DATA.map(d => d.sm)));
   fillSelect('ve-rsm',  unique(VE_DATA.map(d => d.rsm)));
   fillSelect('ve-city', unique(VE_DATA.map(d => d.city)));
@@ -1101,7 +1107,6 @@ function renderFOSTable() {
 // ▸▸▸ VISIT ENGINE ◂◂◂
 // ════════════════════════════════════════════════════════════════
 function getVEFiltered() {
-  const q      = (document.getElementById('ve-q').value || '').toLowerCase();
   const fosSel = document.getElementById('ve-fos').value;
   const sm     = document.getElementById('ve-sm').value;
   const rsm    = document.getElementById('ve-rsm').value;
@@ -1123,10 +1128,7 @@ function getVEFiltered() {
       if (flag === 'C' && !d.flagC) return false;
 
     }
-    if (q) {
-      const haystack = d.fos + ' ' + d.name.toLowerCase() + ' ' + d.code.toLowerCase() + ' ' + d.city.toLowerCase();
-      if (!haystack.includes(q)) return false;
-    }
+
     return true;
   });
 }
