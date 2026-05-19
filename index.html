@@ -553,7 +553,24 @@ async function loadVisits() {
 let VE_DEBUG = { rawRows: [], headerRow: [], colMap: {}, totalRows: 0, skipped: 0, noFlag: 0, parsed: 0 };
 
 async function loadVisitEngine() {
-  // Try primary URL, with fallback to gviz endpoint
+  // ── Sheet structure (from screenshot, hardcoded positional) ──
+  // Row 0: Date merged headers (skip)
+  // Row 1: Column labels — but Lead/Red Channel/Disbursals appear TWICE
+  //        (MTD group then LMTD group) — header-based detection breaks on duplicates
+  // Row 2+: Data
+  //
+  // POSITIONAL MAP (0-indexed columns):
+  //  0: Dealer Code   1: Dealership Name   2: Dealer City
+  //  3: FOS Mapped    4: SM Mapped         5: RSM Mapped
+  //  6: Lead(MTD)     7: Red Channel(MTD)  8: Disbursals(MTD)
+  //  9: Lead(LMTD)   10: Red Channel(LMTD) 11: Disbursals(LMTD)
+  // 12: MTD_Visits
+
+  const CI = { code:0, name:1, city:2, fos:3, sm:4, rsm:5,
+               lead_mtd:6, red_mtd:7, disb_mtd:8,
+               lead_lmtd:9, red_lmtd:10, disb_lmtd:11, mtd_visits:12 };
+
+  // Try primary pub URL, then gviz fallback
   const urls = [
     SHEET_VE_URL + "&t=" + Date.now(),
     "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?gid=1211178034&single=true&output=csv&t=" + Date.now()
@@ -566,123 +583,54 @@ async function loadVisitEngine() {
       const res = await fetch(url);
       if (!res.ok) { VE_DEBUG.httpStatus = res.status; continue; }
       const txt = await res.text();
-      // Detect HTML redirect (login page / error page)
       if (txt.trim().startsWith('<') || txt.toLowerCase().includes('<!doctype')) {
         VE_DEBUG.htmlResponse = txt.slice(0, 200);
-        console.warn('[VE] URL returned HTML, not CSV:', url, txt.slice(0, 100));
         continue;
       }
-      raw = txt;
-      usedUrl = url;
-      break;
-    } catch(e) { console.warn('[VE] fetch failed for', url, e); }
+      raw = txt; usedUrl = url; break;
+    } catch(e) { console.warn('[VE] fetch error:', url, e.message); }
   }
 
   if (!raw) {
-    VE_DEBUG.error = 'All URL attempts returned HTML (login redirect) or failed. Sheet must be published to web as CSV: File → Share → Publish to web → CSV format.';
-    VE_DEBUG.rawLines = VE_DEBUG.htmlResponse || '(no response)';
+    VE_DEBUG.error = 'All URL attempts returned HTML or failed. Sheet must be published to web as CSV.';
     return [];
   }
 
-  VE_DEBUG.usedUrl = usedUrl;
-  // Store raw preview for diagnostics (first 5 lines of the CSV text)
-  VE_DEBUG.rawLines = raw.split('\n').slice(0, 5).join('\n');
-
+  VE_DEBUG.usedUrl   = usedUrl;
+  VE_DEBUG.rawLines  = raw.split('\n').slice(0, 5).join('\n');
   const rows = parseCSV(raw);
   VE_DEBUG.totalRows = rows.length;
+  VE_DEBUG.rawRows   = rows.slice(0, 4); // first 4 rows for debug (incl. date row + header row)
 
-  if (rows.length < 2) {
-    VE_DEBUG.error = 'Sheet returned fewer than 2 rows — check it is published to web as CSV';
+  if (rows.length < 3) {
+    VE_DEBUG.error = `Sheet returned only ${rows.length} rows. Expected 3+ (date header + col header + data).`;
     return [];
   }
 
-  // ── Store raw first 3 rows for display ───────────────────────
-  VE_DEBUG.rawRows = rows.slice(0, 3);
+  // Data starts at row index 2 (skip date-header row 0 and col-name row 1)
+  const DATA_START = 2;
 
-  // ── Find the header row ──────────────────────────────────────
-  // Look for a row that contains at least one known column keyword
-  const KNOWN = ['dealer', 'fos', 'lead', 'disb', 'visit', 'city', 'rsm'];
-  let headerIdx = 0; // default: row 0
-  for (let i = 0; i < Math.min(5, rows.length); i++) {
-    const joined = rows[i].join('|').toLowerCase();
-    if (KNOWN.some(k => joined.includes(k))) { headerIdx = i; break; }
-  }
+  VE_DEBUG.headerRow = rows[1] || []; // the actual column-name row for display
+  VE_DEBUG.colMap    = CI;
+  VE_DEBUG.skipped   = 0;
+  VE_DEBUG.noFlag    = 0;
+  VE_DEBUG.parsed    = 0;
 
-  // ── Build header→index map ───────────────────────────────────
-  // Normalize: lowercase, collapse spaces/underscores/dashes to single underscore
-  const norm  = s => s.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '');
-  const hdrs  = rows[headerIdx].map(norm);
-  VE_DEBUG.headerRow = hdrs;
+  console.log('[VE] rows total:', rows.length, '| data from idx:', DATA_START);
+  console.log('[VE] col-name row (row 1):', rows[1]);
+  console.log('[VE] first data row (row 2):', rows[2]);
 
-  // Exact match, then prefix match, then substring match — NEVER match 'sm' inside 'rsm'
-  const findCol = (exact, ...aliases) => {
-    // Pass 1: exact
-    let idx = hdrs.indexOf(exact);
-    if (idx !== -1) return idx;
-    // Pass 2: aliases exact
-    for (const a of aliases) { idx = hdrs.indexOf(a); if (idx !== -1) return idx; }
-    // Pass 3: exact word boundary (underscore-bordered)
-    const tryBound = (t) => hdrs.findIndex(h => h === t || h.startsWith(t + '_') || h.endsWith('_' + t));
-    idx = tryBound(exact);
-    if (idx !== -1) return idx;
-    for (const a of aliases) { idx = tryBound(a); if (idx !== -1) return idx; }
-    // Pass 4: substring (last resort)
-    idx = hdrs.findIndex(h => h.includes(exact));
-    if (idx !== -1) return idx;
-    for (const a of aliases) { idx = hdrs.findIndex(h => h.includes(a)); if (idx !== -1) return idx; }
-    return -1;
-  };
-
-  // ── Log all headers for diagnostics ─────────────────────────
-  console.log('[VE] All headers:', hdrs.map((h,i) => i+':'+h).join(', '));
-
-  const CI = {
-    code:       findCol('dealer_code','code','dlr_code','dealercode','dealer_id'),
-    name:       findCol('dealer_name','name','dlr_name','dealership','dealer'),
-    // "Dealer City" → normalises to "dealer_city"
-    city:       findCol('city','dealer_city','location','hub'),
-    fos:        findCol('fos','fo','field_officer','fo_name','fo_email','fos_name'),
-    // SM exact first to avoid matching RSM
-    sm:         hdrs.indexOf('sm') !== -1 ? hdrs.indexOf('sm') : findCol('sm_name','sm_email','sales_manager'),
-    rsm:        findCol('rsm','rsm_name','rsm_email','regional_sm'),
-    // "Leads" / "Lead MTD" / "Lead_MTD"
-    lead_mtd:   findCol('lead_mtd','leads_mtd','lead_count_mtd','leads','lead'),
-    // "Red" / "Red MTD"
-    red_mtd:    findCol('red_mtd','redmtd','red_channel_mtd','discarded_mtd','red'),
-    // "Disbursals" / "Disb MTD" / "Disbursal"
-    disb_mtd:   findCol('disb_mtd','disbmtd','disbursals_mtd','disbursal_mtd','disbursals','disbursal','disb'),
-    lead_lmtd:  findCol('lead_lmtd','leads_lmtd','lead_count_lmtd','leads_lmtd'),
-    red_lmtd:   findCol('red_lmtd','redlmtd','red_channel_lmtd'),
-    disb_lmtd:  findCol('disb_lmtd','disblmtd','disbursals_lmtd','disbursal_lmtd'),
-    mtd_visits: findCol('mtd_visits','visits_mtd','visit_count_mtd','total_visits','mtd_visit','visits'),
-  };
-
-  // Positional fallback for any col still -1
-  const POS = { code:0, name:1, city:2, fos:3, sm:4, rsm:5,
-                lead_mtd:6, red_mtd:7, disb_mtd:8,
-                lead_lmtd:9, red_lmtd:10, disb_lmtd:11, mtd_visits:12 };
-  Object.keys(CI).forEach(k => { if (CI[k] === -1) CI[k] = POS[k]; });
-  VE_DEBUG.colMap = CI;
-
-  console.log('[VE] headerIdx:', headerIdx, '| headers:', hdrs);
-  console.log('[VE] column map:', CI);
-
-  const g = (row, k) => (row[CI[k]] !== undefined ? String(row[CI[k]]).trim() : '');
-  const n = (row, k) => Math.max(0, parseFloat(g(row, k)) || 0);
+  const g = (r, k) => { const v = r[CI[k]]; return v !== undefined ? String(v).trim() : ''; };
+  const n = (r, k) => Math.max(0, parseFloat(g(r, k)) || 0);
 
   const dealers = [];
-  VE_DEBUG.skipped = 0;
-  VE_DEBUG.noFlag  = 0;
 
-  for (let i = headerIdx + 1; i < rows.length; i++) {
+  for (let i = DATA_START; i < rows.length; i++) {
     const r = rows[i];
-    if (!r || r.every(c => !String(c).trim())) continue;  // blank row
+    if (!r || r.length < 4 || r.every(c => !String(c).trim())) continue;
 
     const fos = g(r, 'fos');
-    if (!fos || /^unmapped$/i.test(fos) || fos === '-' || fos === '') {
-      VE_DEBUG.skipped++;
-      continue;
-    }
+    if (!fos || /^unmapped$/i.test(fos) || fos === '-') { VE_DEBUG.skipped++; continue; }
 
     const lead_mtd   = n(r, 'lead_mtd');
     const red_mtd    = n(r, 'red_mtd');
@@ -694,13 +642,10 @@ async function loadVisitEngine() {
 
     // ── FLAG A: Activity Reversal ──────────────────────────────
     const flagA = ((lead_lmtd > 0 || disb_lmtd > 0) && lead_mtd === 0 && disb_mtd === 0) ? 1 : 0;
-
     // ── FLAG B: Lead Drop > 40% ────────────────────────────────
     const flagB = (lead_lmtd >= 2 && lead_mtd < lead_lmtd && (lead_lmtd - lead_mtd) / lead_lmtd > 0.4) ? 1 : 0;
-
     // ── FLAG C: Disbursal Drop ─────────────────────────────────
     const flagC = (disb_lmtd >= 1 && disb_mtd < disb_lmtd) ? 1 : 0;
-
     // ── FLAG D: Red Channel Spike ──────────────────────────────
     let flagD = 0;
     if (lead_mtd >= 2 && red_mtd >= 1) {
@@ -717,10 +662,6 @@ async function loadVisitEngine() {
       0.4 * Math.min(mtd_visits, 5)
     ).toFixed(3);
 
-    const actionType = mtd_visits === 0 ? 'NEW VISIT'
-                     : mtd_visits <= 3  ? 'RE-VISIT'
-                     : 'ESCALATE';
-
     dealers.push({
       code: g(r,'code'), name: g(r,'name'),
       city: g(r,'city') || 'Unknown',
@@ -731,12 +672,13 @@ async function loadVisitEngine() {
       lead_lmtd, red_lmtd, disb_lmtd,
       mtd_visits, score,
       flagA, flagB, flagC, flagD,
-      actionType, recommended: false
+      actionType: mtd_visits === 0 ? 'NEW VISIT' : mtd_visits <= 3 ? 'RE-VISIT' : 'ESCALATE',
+      recommended: false
     });
   }
 
   VE_DEBUG.parsed = dealers.length;
-  console.log(`[VE] DONE: ${dealers.length} at-risk | skipped(unmapped)=${VE_DEBUG.skipped} | skipped(noFlag)=${VE_DEBUG.noFlag}`);
+  console.log(`[VE] At-risk: ${dealers.length} | Unmapped skipped: ${VE_DEBUG.skipped} | No-flag skipped: ${VE_DEBUG.noFlag}`);
 
   dealers.sort((a,b) => b.score - a.score);
   const fosCounts = {};
@@ -744,7 +686,6 @@ async function loadVisitEngine() {
     if (!fosCounts[d.fos]) fosCounts[d.fos] = 0;
     if (fosCounts[d.fos] < 2) { d.recommended = true; fosCounts[d.fos]++; }
   });
-
   return dealers;
 }
 
