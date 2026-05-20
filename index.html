@@ -306,9 +306,9 @@ tr:last-child td{border-bottom:none}
       <span class="flabel">Flag</span>
       <select id="ve-flag" onchange="renderVisitEngine()">
         <option value="">All Flags</option>
-        <option value="A">Flag A — Activity Reversal</option>
-        <option value="B">Flag B — Lead Drop</option>
-        <option value="C">Flag C — Disbursal Drop</option>
+        <option value="A">Flag A — Lead Inactive</option>
+        <option value="B">Flag B — Disbursal Inactive</option>
+        <option value="C">Flag C — Disbursal Drop ≥50%</option>
 
       </select>
       <span class="flabel">Show</span>
@@ -326,9 +326,9 @@ tr:last-child td{border-bottom:none}
     <div class="fbar" style="margin-bottom:14px;padding:8px 14px">
       <span class="ve-section-title" style="margin-bottom:0">🏷️ Flag Key</span>
       <div class="flag-legend">
-        <div class="flag-legend-item"><span class="flag-pill flag-a">A</span><span>Activity Reversal — Active LMTD, dead MTD</span></div>
-        <div class="flag-legend-item"><span class="flag-pill flag-b">B</span><span>Lead Drop — LMTD ≥ 2, MTD drop &gt;40%</span></div>
-        <div class="flag-legend-item"><span class="flag-pill flag-c">C</span><span>Disbursal Drop — Disb MTD &lt; Disb LMTD</span></div>
+        <div class="flag-legend-item"><span class="flag-pill flag-a">A</span><span>Lead Inactive — Had leads LMTD, zero MTD (+10)</span></div>
+        <div class="flag-legend-item"><span class="flag-pill flag-b">B</span><span>Disbursal Inactive — Had disbursals LMTD, zero MTD (+15)</span></div>
+        <div class="flag-legend-item"><span class="flag-pill flag-c">C</span><span>Disbursal Drop ≥50% — Significant fall MTD vs LMTD (+8)</span></div>
 
         <div class="flag-legend-item" style="margin-left:auto;color:#64748b;font-size:10px">
           <span class="recommended-dot"></span>Green rows = Today's recommendations (top 2 per FOS)
@@ -484,20 +484,34 @@ function currentMonthName() {
 // ════════════════════════════════════════════════════════════════
 // DATA LOADERS
 // ════════════════════════════════════════════════════════════════
-async function loadFOS() {
-  const res = await fetch(SHEET_FOS_URL + "&t=" + Date.now());
-  if (!res.ok) throw new Error("FOS sheet HTTP " + res.status);
-  const rawText = await res.text();
-  // Detect HTML redirect (login page)
-  if (rawText.trim().startsWith('<')) throw new Error("FOS sheet returned HTML — check it is published to web as CSV");
-  const rows = parseCSV(rawText);
-  // Detect wrong tab: if no row has "@" in col 0, the default tab may have changed
-  const hasEmails = rows.some(r => r[0] && r[0].includes("@"));
-  if (rows.length > 2 && !hasEmails) {
-    console.warn('[FOS] No email addresses found in col 0 — wrong tab may be loading. First row col0:', rows[0]?.[0], rows[1]?.[0]);
-    const errDiv = document.getElementById('error-box');
-    if (errDiv) errDiv.innerHTML = '<div class="err">⚠️ FOS sheet appears to be loading the wrong tab (no FOS emails found). Open the FOS summary sheet tab → File → Share → Publish to web → select the FOS tab → copy the URL with its gid → share with us.</div>';
+// ════════════════════════════════════════════════════════════════
+// FETCH HELPER — retries up to 3x on HTML responses (Google Sheets
+// cold-start returns HTML on first request after inactivity)
+// ════════════════════════════════════════════════════════════════
+async function fetchCSV(url) {
+  const MAX = 3;
+  for (let i = 0; i < MAX; i++) {
+    if (i > 0) await new Promise(r => setTimeout(r, 1200 * i)); // 0, 1.2s, 2.4s
+    try {
+      const res = await fetch(url + (url.includes('?') ? '&' : '?') + '_t=' + Date.now());
+      if (!res.ok) { console.warn('[fetchCSV] HTTP', res.status, 'attempt', i+1); continue; }
+      const txt = await res.text();
+      if (txt.trim().startsWith('<') || txt.trim().length < 10) {
+        console.warn('[fetchCSV] Got HTML/empty on attempt', i+1, '— retrying...');
+        continue;
+      }
+      return txt;
+    } catch(e) { console.warn('[fetchCSV] Error attempt', i+1, e.message); }
   }
+  throw new Error('Could not fetch CSV after ' + MAX + ' attempts: ' + url.slice(0,80));
+}
+
+// ════════════════════════════════════════════════════════════════
+// DATA LOADERS
+// ════════════════════════════════════════════════════════════════
+async function loadFOS() {
+  const raw = await fetchCSV(SHEET_FOS_URL);
+  const rows = parseCSV(raw);
   const fos = [];
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i];
@@ -520,9 +534,8 @@ async function loadFOS() {
 }
 
 async function loadVisits() {
-  const res = await fetch(SHEET_VISITS_URL + "&t=" + Date.now());
-  if (!res.ok) throw new Error("Visits sheet HTTP " + res.status);
-  const rows = parseCSV(await res.text());
+  const raw = await fetchCSV(SHEET_VISITS_URL);
+  const rows = parseCSV(raw);
   const visits = [];
   for (let i = 1; i < rows.length; i++) {
     const r = rows[i];
@@ -550,83 +563,37 @@ async function loadVisits() {
 }
 
 // ════════════════════════════════════════════════════════════════
-// VISIT ENGINE LOADER
-// Columns MUST be in this exact order in the sheet (row 0 = headers):
-//   0:Dealer_Code  1:Dealer_Name  2:City       3:FOS
-//   4:SM           5:RSM          6:Lead_MTD   7:Red_MTD
-//   8:Disb_MTD     9:Lead_LMTD   10:Red_LMTD  11:Disb_LMTD
-//  12:MTD_Visits
-// Falls back to positional if header names differ.
+// VISIT ENGINE LOADER — hardcoded positional columns (see screenshot)
+// Row 0: date headers (skip), Row 1: col names (skip), Row 2+: data
 // ════════════════════════════════════════════════════════════════
 let VE_DEBUG = { rawRows: [], headerRow: [], colMap: {}, totalRows: 0, skipped: 0, noFlag: 0, parsed: 0 };
 
 async function loadVisitEngine() {
-  // ── Sheet structure (from screenshot, hardcoded positional) ──
-  // Row 0: Date merged headers (skip)
-  // Row 1: Column labels — but Lead/Red Channel/Disbursals appear TWICE
-  //        (MTD group then LMTD group) — header-based detection breaks on duplicates
-  // Row 2+: Data
-  //
-  // POSITIONAL MAP (0-indexed columns):
-  //  0: Dealer Code   1: Dealership Name   2: Dealer City
-  //  3: FOS Mapped    4: SM Mapped         5: RSM Mapped
-  //  6: Lead(MTD)     7: Red Channel(MTD)  8: Disbursals(MTD)   [col 7 unused]
-  //  9: Lead(LMTD)   10: Red Channel(LMTD) 11: Disbursals(LMTD) [col 10 unused]
-  // 12: MTD_Visits
-
   const CI = { code:0, name:1, city:2, fos:3, sm:4, rsm:5,
                lead_mtd:6, disb_mtd:8,
                lead_lmtd:9, disb_lmtd:11, mtd_visits:12 };
 
-  // Try primary pub URL, then gviz fallback
-  const urls = [
-    SHEET_VE_URL + "&t=" + Date.now(),
-    "https://docs.google.com/spreadsheets/d/e/2PACX-1vS2xsziqavFUxnHCkPQ71eifBaShjm8B8t6clmTQgnLKpQSuAj9hU6FQpfnwOdPI5VTfAsXVDWrDhYn/pub?gid=1211178034&single=true&output=csv&t=" + Date.now()
-  ];
+  const raw = await fetchCSV(SHEET_VE_URL);
 
-  let raw = '';
-  let usedUrl = '';
-  for (const url of urls) {
-    try {
-      const res = await fetch(url);
-      if (!res.ok) { VE_DEBUG.httpStatus = res.status; continue; }
-      const txt = await res.text();
-      if (txt.trim().startsWith('<') || txt.toLowerCase().includes('<!doctype')) {
-        VE_DEBUG.htmlResponse = txt.slice(0, 200);
-        continue;
-      }
-      raw = txt; usedUrl = url; break;
-    } catch(e) { console.warn('[VE] fetch error:', url, e.message); }
-  }
-
-  if (!raw) {
-    VE_DEBUG.error = 'All URL attempts returned HTML or failed. Sheet must be published to web as CSV.';
-    return [];
-  }
-
-  VE_DEBUG.usedUrl   = usedUrl;
   VE_DEBUG.rawLines  = raw.split('\n').slice(0, 5).join('\n');
   const rows = parseCSV(raw);
   VE_DEBUG.totalRows = rows.length;
-  VE_DEBUG.rawRows   = rows.slice(0, 4); // first 4 rows for debug (incl. date row + header row)
+  VE_DEBUG.rawRows   = rows.slice(0, 4);
 
   if (rows.length < 3) {
-    VE_DEBUG.error = `Sheet returned only ${rows.length} rows. Expected 3+ (date header + col header + data).`;
+    VE_DEBUG.error = `Sheet returned only ${rows.length} rows.`;
     return [];
   }
 
-  // Data starts at row index 2 (skip date-header row 0 and col-name row 1)
   const DATA_START = 2;
-
-  VE_DEBUG.headerRow = rows[1] || []; // the actual column-name row for display
+  VE_DEBUG.headerRow = rows[1] || [];
   VE_DEBUG.colMap    = CI;
   VE_DEBUG.skipped   = 0;
   VE_DEBUG.noFlag    = 0;
   VE_DEBUG.parsed    = 0;
 
-  console.log('[VE] rows total:', rows.length, '| data from idx:', DATA_START);
-  console.log('[VE] col-name row (row 1):', rows[1]);
-  console.log('[VE] first data row (row 2):', rows[2]);
+  console.log('[VE] rows total:', rows.length, '| col-name row:', rows[1]);
+  console.log('[VE] first data row:', rows[2]);
 
   const g = (r, k) => { const v = r[CI[k]]; return v !== undefined ? String(v).trim() : ''; };
   const n = (r, k) => Math.max(0, parseFloat(g(r, k)) || 0);
@@ -641,26 +608,40 @@ async function loadVisitEngine() {
     if (!fos || /^unmapped$/i.test(fos) || fos === '-') { VE_DEBUG.skipped++; continue; }
 
     const lead_mtd   = n(r, 'lead_mtd');
-    const red_mtd    = n(r, 'red_mtd');
     const disb_mtd   = n(r, 'disb_mtd');
     const lead_lmtd  = n(r, 'lead_lmtd');
-    const red_lmtd   = n(r, 'red_lmtd');
     const disb_lmtd  = n(r, 'disb_lmtd');
     const mtd_visits = n(r, 'mtd_visits');
 
-    // ── FLAG A: Activity Reversal ──────────────────────────────
-    const flagA = ((lead_lmtd > 0 || disb_lmtd > 0) && lead_mtd === 0 && disb_mtd === 0) ? 1 : 0;
-    // ── FLAG B: Lead Drop > 40% ────────────────────────────────
-    const flagB = (lead_lmtd >= 2 && lead_mtd < lead_lmtd && (lead_lmtd - lead_mtd) / lead_lmtd > 0.4) ? 1 : 0;
-    // ── FLAG C: Disbursal Drop ─────────────────────────────────
-    const flagC = (disb_lmtd >= 1 && disb_mtd < disb_lmtd) ? 1 : 0;
+    // ── FLAG A: Lead Inactive ──────────────────────────────────
+    // Had leads last month, zero this month
+    const flagA = (lead_lmtd >= 1 && lead_mtd === 0) ? 1 : 0;
+
+    // ── FLAG B: Disbursal Inactive ─────────────────────────────
+    // Had disbursals last month, zero this month
+    const flagB = (disb_lmtd >= 1 && disb_mtd === 0) ? 1 : 0;
+
+    // ── FLAG C: Disbursal Drop ≥50% ────────────────────────────
+    // Disbursals fell by half or more vs last month
+    const flagC = (disb_lmtd >= 2 && disb_mtd < disb_lmtd &&
+                   (disb_lmtd - disb_mtd) / disb_lmtd >= 0.5) ? 1 : 0;
+
     if (!flagA && !flagB && !flagC) { VE_DEBUG.noFlag++; continue; }
 
-    const score = +(
-      3*flagA + 2*flagC + 1.5*flagB +
-      0.3 * Math.log(1 + lead_lmtd + 3*disb_lmtd) -
-      0.4 * Math.min(mtd_visits, 5)
-    ).toFixed(3);
+    // ── SCORE — each condition = +10, visit factor unchanged ────
+    let score = 0;
+    if (flagA) score += 10;  // leads gone silent
+    if (flagB) score += 10;  // disbursals gone silent
+    if (flagC) score += 10;  // disbursals dropped ≥50%
+    // Lead drop ≥50%
+    if (lead_lmtd >= 2 && lead_mtd < lead_lmtd &&
+        (lead_lmtd - lead_mtd) / lead_lmtd >= 0.5) score += 10;
+    // High-value dealer (Disb LMTD ≥ 3)
+    if (disb_lmtd >= 3) score += 10;
+    // Visit factor: reward unvisited, penalise over-visited
+    if      (mtd_visits === 0)  score += 5;
+    else if (mtd_visits <= 3)   score -= (2 * mtd_visits);
+    else                        score -= 10;
 
     dealers.push({
       code: g(r,'code'), name: g(r,'name'),
@@ -668,17 +649,15 @@ async function loadVisitEngine() {
       fos:  fos.toLowerCase(),
       sm:   g(r,'sm').toLowerCase(),
       rsm:  g(r,'rsm').toLowerCase(),
-      lead_mtd, disb_mtd,
-      lead_lmtd, disb_lmtd,
-      mtd_visits, score,
-      flagA, flagB, flagC,
+      lead_mtd, disb_mtd, lead_lmtd, disb_lmtd,
+      mtd_visits, score, flagA, flagB, flagC,
       actionType: mtd_visits === 0 ? 'NEW VISIT' : mtd_visits <= 3 ? 'RE-VISIT' : 'ESCALATE',
       recommended: false
     });
   }
 
   VE_DEBUG.parsed = dealers.length;
-  console.log(`[VE] At-risk: ${dealers.length} | Unmapped skipped: ${VE_DEBUG.skipped} | No-flag skipped: ${VE_DEBUG.noFlag}`);
+  console.log(`[VE] At-risk: ${dealers.length} | unmapped: ${VE_DEBUG.skipped} | noFlag: ${VE_DEBUG.noFlag}`);
 
   dealers.sort((a,b) => b.score - a.score);
   const fosCounts = {};
@@ -690,32 +669,46 @@ async function loadVisitEngine() {
 }
 
 // ════════════════════════════════════════════════════════════════
-// LOAD ALL — VE loads independently so FOS/Visits still work if VE fails
+// LOAD ALL — all 3 sheets load in PARALLEL via Promise.allSettled
+// One sheet failing never blocks the others
 // ════════════════════════════════════════════════════════════════
 async function loadAllData() {
-  try {
-    const [fos, visits] = await Promise.all([loadFOS(), loadVisits()]);
-    FOS_DATA     = fos;
-    VISITS_DATA  = visits;
-  } catch (err) {
-    console.error('[FOS/Visits load error]', err);
-    document.getElementById('error-box').innerHTML =
-      '<div class="err">⚠️ FOS/Visits data load failed: ' + err.message + '</div>';
-    document.getElementById('sync-txt').textContent = 'Sync failed';
-    return false;
+  const [fosRes, visitsRes, veRes] = await Promise.allSettled([
+    loadFOS(), loadVisits(), loadVisitEngine()
+  ]);
+
+  // Apply results — each is independent
+  if (fosRes.status === 'fulfilled') {
+    FOS_DATA = fosRes.value;
+  } else {
+    console.error('[FOS load failed]', fosRes.reason);
+    FOS_DATA = [];
   }
 
-  // Load VE separately — failure here does NOT block the rest of the dashboard
-  try {
-    VE_DATA = await loadVisitEngine();
-  } catch (err) {
-    console.error('[VE load error]', err);
-    VE_DEBUG.error = err.message;
+  if (visitsRes.status === 'fulfilled') {
+    VISITS_DATA = visitsRes.value;
+  } else {
+    console.error('[Visits load failed]', visitsRes.reason);
+    VISITS_DATA = [];
+  }
+
+  if (veRes.status === 'fulfilled') {
+    VE_DATA = veRes.value;
+  } else {
+    console.error('[VE load failed]', veRes.reason);
+    VE_DEBUG.error = String(veRes.reason);
     VE_DATA = [];
   }
 
   const now = new Date().toLocaleTimeString('en-IN', {timeZone:'Asia/Kolkata', hour:'2-digit', minute:'2-digit', hour12:true});
   document.getElementById('sync-txt').textContent = 'Synced ' + now;
+
+  if (FOS_DATA.length === 0 && VISITS_DATA.length === 0) {
+    document.getElementById('error-box').innerHTML =
+      '<div class="err">⚠️ Could not load FOS or Visits data. Check sheet is published as CSV and try refreshing.</div>';
+    return false;
+  }
+
   document.getElementById('error-box').innerHTML = '';
   return true;
 }
@@ -1309,7 +1302,7 @@ function renderVisitEngineTable() {
       <td>${flagsHTML(d)}</td>
       <td>
         <div class="score-bar">
-          <span class="score-num">${d.score.toFixed(1)}</span>
+          <span class="score-num">${d.score}</span>
           <div class="score-track"><div class="score-fill" style="width:${pct}%"></div></div>
         </div>
       </td>
